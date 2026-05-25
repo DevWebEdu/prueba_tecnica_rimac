@@ -1,0 +1,260 @@
+openapi: '3.0.0'
+
+info:
+  title: Medical Appointment Scheduling API
+  description: |
+    ## Descripcion
+    Backend para agendamiento de citas medicas de asegurados de Rimac.
+    Soporta Peru (PE) y Chile (CL) con procesamiento asincrono por pais.
+
+    ## Flujo de procesamiento
+    1. El cliente llama `POST /appointments` y recibe confirmacion **202 Accepted**
+    2. En background: SNS enruta el mensaje al SQS del pais correspondiente
+    3. El Lambda del pais persiste en MySQL y emite conformidad a EventBridge
+    4. El Lambda principal actualiza el estado a `completed` en DynamoDB
+
+    El `GET /appointments/{insuredId}` puede mostrar `pending` inicialmente
+    y `completed` unos segundos despues, una vez cerrado el ciclo.
+
+  version: '1.0.0'
+  contact:
+    name: Backend Team - Rimac
+
+servers:
+  - url: https://{apiId}.execute-api.{region}.amazonaws.com/{stage}
+    description: AWS API Gateway
+    variables:
+      apiId:
+        default: your-api-id
+        description: ID del API Gateway desplegado
+      region:
+        default: us-east-1
+        description: Region de AWS
+      stage:
+        default: dev
+        description: Stage del despliegue (dev, prod)
+
+tags:
+  - name: Appointments
+    description: Operaciones de agendamiento de citas medicas
+
+paths:
+  /appointments:
+    post:
+      tags:
+        - Appointments
+      summary: Crear un nuevo agendamiento
+      description: |
+        Recibe la solicitud, la registra en DynamoDB con estado `pending`
+        y la encola en SNS para procesamiento asincrono.
+        La respuesta **202 Accepted** confirma que la solicitud fue recibida,
+        no que el agendamiento esta confirmado.
+      operationId: createAppointment
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateAppointmentRequest'
+            examples:
+              peru:
+                summary: Agendamiento en Peru
+                value:
+                  insuredId: '00123'
+                  scheduleId: 100
+                  countryISO: 'PE'
+              chile:
+                summary: Agendamiento en Chile
+                value:
+                  insuredId: '00456'
+                  scheduleId: 200
+                  countryISO: 'CL'
+      responses:
+        '202':
+          description: Solicitud aceptada. El agendamiento esta en proceso.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateAppointmentResponse'
+              example:
+                message: 'El agendamiento esta en proceso'
+                appointmentId: '550e8400-e29b-41d4-a716-446655440000'
+        '400':
+          description: Datos de entrada invalidos
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              examples:
+                insuredId_invalido:
+                  summary: insuredId con formato incorrecto
+                  value:
+                    message: 'insuredId must be a 5-digit string'
+                countryISO_invalido:
+                  summary: pais no soportado
+                  value:
+                    message: 'countryISO must be PE or CL'
+                scheduleId_invalido:
+                  summary: scheduleId no es numero
+                  value:
+                    message: 'scheduleId must be a number'
+        '500':
+          description: Error interno del servidor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /appointments/{insuredId}:
+    get:
+      tags:
+        - Appointments
+      summary: Obtener agendamientos por asegurado
+      description: |
+        Retorna el historial completo de agendamientos de un asegurado,
+        incluyendo el estado actual de cada uno (`pending` o `completed`).
+      operationId: getAppointmentsByInsuredId
+      parameters:
+        - in: path
+          name: insuredId
+          required: true
+          schema:
+            type: string
+            pattern: '^\d{5}$'
+            example: '00123'
+          description: |
+            Codigo del asegurado de exactamente 5 digitos.
+            Puede tener ceros al inicio (ej: `00123`, `00001`).
+      responses:
+        '200':
+          description: Lista de agendamientos del asegurado (puede ser vacia)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/GetAppointmentsResponse'
+              example:
+                appointments:
+                  - appointmentId: '550e8400-e29b-41d4-a716-446655440000'
+                    insuredId: '00123'
+                    scheduleId: 100
+                    countryISO: 'PE'
+                    status: 'completed'
+                    createdAt: '2024-01-15T10:30:00Z'
+                    updatedAt: '2024-01-15T10:30:45Z'
+                  - appointmentId: '661f9511-f30c-52e5-b827-557766551111'
+                    insuredId: '00123'
+                    scheduleId: 101
+                    countryISO: 'CL'
+                    status: 'pending'
+                    createdAt: '2024-01-15T11:00:00Z'
+                    updatedAt: '2024-01-15T11:00:00Z'
+        '400':
+          description: Formato de insuredId invalido
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                message: 'insuredId must be a 5-digit string'
+        '500':
+          description: Error interno del servidor
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+components:
+  schemas:
+    CreateAppointmentRequest:
+      type: object
+      required:
+        - insuredId
+        - scheduleId
+        - countryISO
+      properties:
+        insuredId:
+          type: string
+          pattern: '^\d{5}$'
+          description: Codigo del asegurado — exactamente 5 digitos, permite ceros al inicio
+          example: '00123'
+        scheduleId:
+          type: integer
+          description: |
+            Identificador del espacio de cita disponible.
+            Representa el conjunto: centro medico + especialidad + medico + fecha/hora.
+          example: 100
+        countryISO:
+          type: string
+          enum:
+            - PE
+            - CL
+          description: Codigo ISO del pais. Solo se aceptan PE (Peru) y CL (Chile).
+          example: 'PE'
+
+    CreateAppointmentResponse:
+      type: object
+      properties:
+        message:
+          type: string
+          description: Confirmacion de que la solicitud fue recibida
+          example: 'El agendamiento esta en proceso'
+        appointmentId:
+          type: string
+          format: uuid
+          description: Identificador unico generado para el agendamiento
+          example: '550e8400-e29b-41d4-a716-446655440000'
+
+    AppointmentItem:
+      type: object
+      description: Representacion de un agendamiento con su estado actual
+      properties:
+        appointmentId:
+          type: string
+          format: uuid
+          description: Identificador unico del agendamiento
+        insuredId:
+          type: string
+          description: Codigo del asegurado
+          example: '00123'
+        scheduleId:
+          type: integer
+          description: Identificador del espacio de cita
+          example: 100
+        countryISO:
+          type: string
+          enum: [PE, CL]
+          description: Pais del agendamiento
+        status:
+          type: string
+          enum: [pending, completed]
+          description: |
+            Estado actual del agendamiento:
+            - `pending`: recibido, procesamiento en curso
+            - `completed`: procesado y confirmado en la base de datos del pais
+        createdAt:
+          type: string
+          format: date-time
+          description: Fecha y hora de creacion (ISO 8601)
+          example: '2024-01-15T10:30:00Z'
+        updatedAt:
+          type: string
+          format: date-time
+          description: Fecha y hora de la ultima actualizacion (ISO 8601)
+          example: '2024-01-15T10:30:45Z'
+
+    GetAppointmentsResponse:
+      type: object
+      properties:
+        appointments:
+          type: array
+          description: Lista de agendamientos del asegurado (vacia si no tiene ninguno)
+          items:
+            $ref: '#/components/schemas/AppointmentItem'
+
+    ErrorResponse:
+      type: object
+      properties:
+        message:
+          type: string
+          description: Descripcion del error ocurrido
+          example: 'insuredId must be a 5-digit string'

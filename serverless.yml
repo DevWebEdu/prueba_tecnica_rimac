@@ -1,0 +1,226 @@
+service: medical-appointment-backend
+
+frameworkVersion: '3'
+
+provider:
+  name: aws
+  runtime: nodejs20.x
+  stage: ${opt:stage, 'dev'}
+  region: ${opt:region, 'us-east-1'}
+  environment:
+    APPOINTMENTS_TABLE: ${self:service}-appointments-${self:provider.stage}
+    SNS_TOPIC_ARN: !Ref AppointmentTopic
+    SQS_COMPLETION_URL: !Ref AppointmentCompletionQueue
+    EVENT_BUS_NAME: !Ref AppointmentEventBus
+    RDS_HOST: ${env:RDS_HOST}
+    RDS_PORT: ${env:RDS_PORT, '3306'}
+    RDS_USER: ${env:RDS_USER}
+    RDS_PASSWORD: ${env:RDS_PASSWORD}
+  iamRoleStatements:
+    - Effect: Allow
+      Action:
+        - dynamodb:PutItem
+        - dynamodb:GetItem
+        - dynamodb:UpdateItem
+        - dynamodb:Query
+      Resource:
+        - !GetAtt AppointmentsTable.Arn
+        - !Sub '${AppointmentsTable.Arn}/index/*'
+    - Effect: Allow
+      Action:
+        - sns:Publish
+      Resource: !Ref AppointmentTopic
+    - Effect: Allow
+      Action:
+        - sqs:SendMessage
+        - sqs:ReceiveMessage
+        - sqs:DeleteMessage
+        - sqs:GetQueueAttributes
+      Resource:
+        - !GetAtt AppointmentQueuePE.Arn
+        - !GetAtt AppointmentQueueCL.Arn
+        - !GetAtt AppointmentCompletionQueue.Arn
+    - Effect: Allow
+      Action:
+        - events:PutEvents
+      Resource: '*'
+
+plugins:
+  - serverless-plugin-typescript
+  - serverless-offline
+
+functions:
+  appointment:
+    handler: src/functions/appointment/handler.main
+    events:
+      - http:
+          path: /appointments
+          method: post
+          cors: true
+      - http:
+          path: /appointments/{insuredId}
+          method: get
+          cors: true
+      - sqs:
+          arn: !GetAtt AppointmentCompletionQueue.Arn
+          batchSize: 1
+
+  appointmentPe:
+    handler: src/functions/appointment-pe/handler.main
+    environment:
+      RDS_DATABASE: ${env:RDS_DATABASE_PE, 'appointments_pe'}
+    events:
+      - sqs:
+          arn: !GetAtt AppointmentQueuePE.Arn
+          batchSize: 1
+
+  appointmentCl:
+    handler: src/functions/appointment-cl/handler.main
+    environment:
+      RDS_DATABASE: ${env:RDS_DATABASE_CL, 'appointments_cl'}
+    events:
+      - sqs:
+          arn: !GetAtt AppointmentQueueCL.Arn
+          batchSize: 1
+
+resources:
+  Resources:
+    # DynamoDB
+    AppointmentsTable:
+      Type: AWS::DynamoDB::Table
+      Properties:
+        TableName: ${self:provider.environment.APPOINTMENTS_TABLE}
+        BillingMode: PAY_PER_REQUEST
+        AttributeDefinitions:
+          - AttributeName: appointmentId
+            AttributeType: S
+          - AttributeName: insuredId
+            AttributeType: S
+        KeySchema:
+          - AttributeName: appointmentId
+            KeyType: HASH
+        GlobalSecondaryIndexes:
+          - IndexName: insuredId-index
+            KeySchema:
+              - AttributeName: insuredId
+                KeyType: HASH
+            Projection:
+              ProjectionType: ALL
+
+    # SNS Topic unico con filtro por pais
+    AppointmentTopic:
+      Type: AWS::SNS::Topic
+      Properties:
+        TopicName: ${self:service}-appointment-topic-${self:provider.stage}
+
+    # SQS para Peru
+    AppointmentQueuePE:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: SQS_PE_${self:provider.stage}
+
+    # SQS para Chile
+    AppointmentQueueCL:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: SQS_CL_${self:provider.stage}
+
+    # SQS para recibir confirmaciones de EventBridge
+    AppointmentCompletionQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: ${self:service}-completion-${self:provider.stage}
+
+    # Permisos para que SNS envie a SQS_PE
+    AppointmentQueuePEPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref AppointmentQueuePE
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt AppointmentQueuePE.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AppointmentTopic
+
+    # Permisos para que SNS envie a SQS_CL
+    AppointmentQueueCLPolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref AppointmentQueueCL
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: sns.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt AppointmentQueueCL.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !Ref AppointmentTopic
+
+    # Suscripcion SNS -> SQS_PE con filtro countryISO = PE
+    SubscriptionPE:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AppointmentTopic
+        Protocol: sqs
+        Endpoint: !GetAtt AppointmentQueuePE.Arn
+        FilterPolicy:
+          countryISO:
+            - PE
+
+    # Suscripcion SNS -> SQS_CL con filtro countryISO = CL
+    SubscriptionCL:
+      Type: AWS::SNS::Subscription
+      Properties:
+        TopicArn: !Ref AppointmentTopic
+        Protocol: sqs
+        Endpoint: !GetAtt AppointmentQueueCL.Arn
+        FilterPolicy:
+          countryISO:
+            - CL
+
+    # EventBridge bus personalizado
+    AppointmentEventBus:
+      Type: AWS::Events::EventBus
+      Properties:
+        Name: ${self:service}-event-bus-${self:provider.stage}
+
+    # Regla que enruta los eventos de conformidad al SQS de completion
+    AppointmentCompletedRule:
+      Type: AWS::Events::Rule
+      Properties:
+        Name: ${self:service}-appointment-completed-${self:provider.stage}
+        EventBusName: !Ref AppointmentEventBus
+        EventPattern:
+          source:
+            - appointment.processing
+          detail-type:
+            - AppointmentCompleted
+        Targets:
+          - Id: CompletionQueueTarget
+            Arn: !GetAtt AppointmentCompletionQueue.Arn
+
+    # Permisos para que EventBridge envie a SQS completion
+    CompletionQueuePolicy:
+      Type: AWS::SQS::QueuePolicy
+      Properties:
+        Queues:
+          - !Ref AppointmentCompletionQueue
+        PolicyDocument:
+          Statement:
+            - Effect: Allow
+              Principal:
+                Service: events.amazonaws.com
+              Action: sqs:SendMessage
+              Resource: !GetAtt AppointmentCompletionQueue.Arn
+              Condition:
+                ArnEquals:
+                  aws:SourceArn: !GetAtt AppointmentCompletedRule.Arn
